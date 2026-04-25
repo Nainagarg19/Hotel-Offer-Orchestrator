@@ -1,0 +1,213 @@
+{
+  "info": {
+    "_postman_id": "a1b2c3d4-hotel-offer-orchestrator",
+    "name": "Hotel Offer Orchestrator",
+    "description": "Tests for the Express API (`src/app.ts`, `src/routes/hotelRoutes.ts`).\n\n**Prerequisites**\n- App on port 3000 (`npm run dev` or `npm start` after `npm run build`)\n- Redis reachable (used when persisting `/api/hotels` results)\n- Temporal worker running (`npm run worker`) so `/api/hotels` can execute the workflow\n\n**Optional: one supplier down**\nThe worker calls `SUPPLIER_BASE_URL` (default `http://localhost:3000`) for `/supplierA/hotels` and `/supplierB/hotels`. To simulate a failure:\n1. Run a mock HTTP server (e.g. Mockoon) that returns **503** (or non-JSON) for **only** `/supplierA/hotels` and returns a JSON **array** for `/supplierB/hotels`.\n2. Start the worker with `SUPPLIER_BASE_URL` pointing at that mock.\n3. Call **GET /health** — expect **503** and `suppliers.supplierA.ok: false`. **GET /api/hotels** will fail the workflow if either supplier fetch throws.\n\nCity matching is case-insensitive (`filterByCity`).",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:3000"
+    }
+  ],
+  "item": [
+    {
+      "name": "Hotels API",
+      "item": [
+        {
+          "name": "GET /api/hotels — Delhi (overlaps)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/hotels?city=delhi",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "hotels"],
+              "query": [
+                {
+                  "key": "city",
+                  "value": "delhi",
+                  "description": "Both suppliers list Holtin; workflow dedupes by name and keeps lowest price (supplier B wins)."
+                }
+              ]
+            },
+            "description": "Expects 200 and a JSON array. **Holtin** appears once with the cheaper supplier B row (`hotelId` **b1**, price **5340**)."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.to.have.status(200));",
+                  "const hotels = pm.response.json();",
+                  "pm.test('Body is array', () => pm.expect(Array.isArray(hotels)).to.be.true);",
+                  "pm.test('Has offers for Delhi', () => pm.expect(hotels.length).to.be.at.least(1));",
+                  "const holtin = hotels.filter((h) => h.name === 'Holtin');",
+                  "pm.test('Holtin deduped to single row', () => pm.expect(holtin.length).to.eql(1));",
+                  "pm.test('Holtin is lowest-price supplier (B)', () => {",
+                  "  pm.expect(holtin[0].hotelId).to.eql('b1');",
+                  "  pm.expect(holtin[0].price).to.eql(5340);",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "GET /api/hotels — No results",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/hotels?city=bangalore",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "hotels"],
+              "query": [
+                {
+                  "key": "city",
+                  "value": "bangalore",
+                  "description": "No seeded hotels for this city — empty array."
+                }
+              ]
+            },
+            "description": "Suppliers only seed **delhi** and **mumbai**. Any other city returns `[]` after the workflow."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.to.have.status(200));",
+                  "pm.test('Empty array', () => pm.expect(pm.response.json()).to.eql([]));"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "GET /api/hotels — Missing city (400)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/hotels",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "hotels"]
+            },
+            "description": "Validation: `city` query param is required."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status 400', () => pm.response.to.have.status(400));",
+                  "pm.test('Error message', () => {",
+                  "  const b = pm.response.json();",
+                  "  pm.expect(b.error).to.include('city');",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "GET /api/hotels — Delhi with price filter",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/hotels?city=delhi&minPrice=5000&maxPrice=6000",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "hotels"],
+              "query": [
+                { "key": "city", "value": "delhi" },
+                { "key": "minPrice", "value": "5000" },
+                { "key": "maxPrice", "value": "6000" }
+              ]
+            },
+            "description": "Runs workflow then filters the Redis-backed list by price. Run **Delhi (overlaps)** once first so Redis has data for this city."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Health & direct suppliers",
+      "item": [
+        {
+          "name": "GET /health",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/health",
+            "description": "Probes `/supplierA/hotels?city=delhi` and `/supplierB/hotels?city=delhi` from the server process. **200** + `status: ok` when both return 200 JSON arrays. **503** + `status: degraded` when either fails (timeouts, wrong `SUPPLIER_BASE_URL`, mock returning errors, etc.)."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "const code = pm.response.code;",
+                  "pm.test('Status 200 or 503', () => pm.expect([200, 503]).to.include(code));",
+                  "const b = pm.response.json();",
+                  "pm.test('Has suppliers probe', () => {",
+                  "  pm.expect(b).to.have.property('suppliers');",
+                  "  pm.expect(b.suppliers).to.have.keys('supplierA', 'supplierB');",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "GET /supplierA/hotels?city=delhi",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/supplierA/hotels?city=delhi",
+              "host": ["{{baseUrl}}"],
+              "path": ["supplierA", "hotels"],
+              "query": [{ "key": "city", "value": "delhi" }]
+            },
+            "description": "Raw supplier A slice for Delhi (includes Holtin at 6000)."
+          }
+        },
+        {
+          "name": "GET /supplierB/hotels?city=delhi",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/supplierB/hotels?city=delhi",
+              "host": ["{{baseUrl}}"],
+              "path": ["supplierB", "hotels"],
+              "query": [{ "key": "city", "value": "delhi" }]
+            },
+            "description": "Raw supplier B slice for Delhi (includes Holtin at 5340)."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Optional — degraded supplier (manual setup)",
+      "description": "No extra endpoint in this repo. After you point the **Temporal worker** at a mock where one supplier path fails, use **GET /health** here: expect **503** and `supplierA.ok` or `supplierB.ok` false. Use **GET /api/hotels** to confirm the workflow errors when a fetch throws.",
+      "item": [
+        {
+          "name": "GET /health (expect degraded after mock)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/health",
+            "description": "Same as the other **/health** request; duplicate so you can disable tests and inspect JSON when simulating outage."
+          }
+        }
+      ]
+    }
+  ]
+}
